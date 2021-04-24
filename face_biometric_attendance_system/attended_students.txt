@@ -1,0 +1,5 @@
+Date: (YYYY-MM-DD) (Date will be displayed here)
+
+Attended Students:
+
+(names of the attented students will be displayed here)

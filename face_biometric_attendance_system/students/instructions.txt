@@ -1,0 +1,3 @@
+put the students' photos in the respective folders
+
+e.g: put atleast 3 different photos of student_1 in (student_1_name folder)

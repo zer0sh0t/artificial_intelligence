@@ -1,0 +1,1942 @@
+from HAL_9000.activation_functions import Sigmoid, ReLU, LeakyReLU, TanH, ELU, Softmax
+import torchvision.transforms as transforms
+from torchvision.utils import save_image
+import torchvision.models as models
+import torch.optim as optim
+from PIL import Image
+import warnings
+import cv2
+from collections import deque, namedtuple
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+import random
+import tqdm
+import copy
+import gym
+import math
+import torch
+import torch.nn as nn
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride,
+                              padding=padding, groups=groups, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.silu = nn.SiLU()
+
+    def forward(self, x):
+        return self.silu(self.bn(self.conv(x)))
+
+
+class SqueezeExciatation(nn.Module):
+    def __init__(self, in_channels, reduced_dim):
+        super().__init__()
+        # kinda like the attention mechanism, computes "attention score" of each channel
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, reduced_dim, 1),
+            nn.SiLU(),
+            nn.Conv2d(reduced_dim, in_channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return x * self.se(x)
+
+
+class InvertedResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
+                 expand_ratio, reduction=4, survival_prob=0.8):
+        super().__init__()
+        self.survival_prob = survival_prob
+        hidden_dim = in_channels * expand_ratio
+        self.expand = in_channels != hidden_dim
+        reduced_dim = int(in_channels / reduction)
+        self.add_skip = in_channels == out_channels and stride == 1
+
+        if self.expand:
+            self.expand_conv = ConvBlock(
+                in_channels, hidden_dim, kernel_size=3, stride=1, padding=1)
+
+        self.conv = nn.Sequential(
+            ConvBlock(hidden_dim, hidden_dim, kernel_size=kernel_size,
+                      stride=stride, padding=padding, groups=hidden_dim),
+            SqueezeExciatation(hidden_dim, reduced_dim),
+            nn.Conv2d(hidden_dim, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+
+    # dropping randomly picked images in the minibatch
+    def stochastic_depth(self, x):
+        if not self.training:
+            return x
+        else:
+            onehot_tensor = torch.rand(
+                x.shape[0], 1, 1, 1, device=x.device) < self.survival_prob
+            return (x / self.survival_prob) * onehot_tensor
+
+    def forward(self, inp):
+        x = self.expand_conv(inp) if self.expand else inp
+        if self.add_skip:
+            return self.stochastic_depth(self.conv(x)) + inp
+        else:
+            return self.conv(x)
+
+
+class EfficientNet(nn.Module):
+    def __init__(self, version, num_classes):
+        super().__init__()
+        self.version_values = {
+            # phi_value, resolution, drop_prob
+            "b0": (0, 224, 0.2),
+            "b1": (0.5, 240, 0.2),
+            "b2": (1, 260, 0.3),
+            "b3": (2, 300, 0.3),
+            "b4": (3, 380, 0.4),
+            "b5": (4, 456, 0.4),
+            "b6": (5, 528, 0.5),
+            "b7": (6, 600, 0.5),
+        }
+
+        self.base_model = [
+            # expand_ratio, channels, repeats, stride, kernel_size
+            [1, 16, 1, 1, 3],
+            [6, 24, 2, 2, 3],
+            [6, 40, 2, 2, 5],
+            [6, 80, 3, 2, 3],
+            [6, 112, 3, 1, 5],
+            [6, 192, 4, 2, 5],
+            [6, 320, 1, 1, 3],
+        ]
+
+        width_factor, depth_factor, drop_prob = self.get_factors(version)
+        last_channels = math.ceil(1280 * width_factor)
+
+        self.mb_convs = self.get_mb_convs(
+            width_factor, depth_factor, last_channels)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.final = nn.Sequential(
+            nn.Dropout(drop_prob),
+            nn.Linear(last_channels, num_classes)
+        )
+
+    def get_factors(self, version, alpha=1.2, beta=1.1):
+        phi, res, drop_prob = self.version_values[version]
+        depth_factor = alpha ** phi
+        width_factor = beta ** phi
+
+        return width_factor, depth_factor, drop_prob
+
+    def get_mb_convs(self, width_factor, depth_factor, last_channels):
+        channels = int(32 * width_factor)
+        mb_conv_layers = [
+            ConvBlock(3, channels, kernel_size=3, stride=2, padding=1)]
+        in_channels = channels
+
+        for expand_ratio, channels, repeats, stride, kernel_size in self.base_model:
+            out_channels = 4 * math.ceil(int(channels * width_factor) / 4)
+            layer_repeats = math.ceil(repeats * depth_factor)
+
+            for layer in range(layer_repeats):
+                mb_conv_layers.append(
+                    InvertedResidualBlock(in_channels, out_channels, kernel_size=kernel_size, stride=stride if layer == 0 else 1,
+                                          padding=kernel_size//2, expand_ratio=expand_ratio)
+                )
+                in_channels = out_channels
+
+        mb_conv_layers.append(
+            ConvBlock(in_channels, last_channels, kernel_size=1, stride=1, padding=0))
+        return nn.Sequential(*mb_conv_layers)
+
+    def forward(self, x):
+        x = self.pool(self.mb_convs(x))
+        x = x.view(x.shape[0], -1)
+        return self.final(x)
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, **kwargs):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, **kwargs)
+        self.batchnorm = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(self.batchnorm(self.conv(x)))
+
+
+class AuxilaryBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.pool = nn.AvgPool2d(kernel_size=(5, 5), stride=(3, 3))
+        self.conv = ConvBlock(in_channels, 128, kernel_size=(1, 1))
+        self.fc1 = nn.Linear(2048, 1024)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=0.7)
+        self.fc2 = nn.Linear(1024, 1000)
+
+    def forward(self, x):
+        x = self.pool(x)
+        x = self.conv(x)
+        x = x.reshape(x.shape[0], -1)
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+
+        return x
+
+
+class InceptionBlock(nn.Module):
+    def __init__(self, in_channels, out_1x1, red_3x3, out_3x3, red_5x5, out_5x5, out_1x1pool):
+        super().__init__()
+        self.branch1 = ConvBlock(in_channels, out_1x1, kernel_size=(1, 1))
+
+        self.branch2 = nn.Sequential(ConvBlock(in_channels, red_3x3, kernel_size=(1, 1)),
+                                     ConvBlock(red_3x3, out_3x3, kernel_size=(3, 3), padding=(1, 1)))
+
+        self.branch3 = nn.Sequential(ConvBlock(in_channels, red_5x5, kernel_size=(1, 1)),
+                                     ConvBlock(red_5x5, out_5x5, kernel_size=(5, 5), padding=(2, 2)))
+
+        self.branch4 = nn.Sequential(nn.MaxPool2d(kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+                                     ConvBlock(in_channels, out_1x1pool, kernel_size=(1, 1)))
+
+    def forward(self, x):
+        return torch.cat([self.branch1(x), self.branch2(x), self.branch3(x), self.branch4(x)], dim=1)
+
+
+class GoogLeNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = ConvBlock(in_channels=3, out_channels=64, kernel_size=(
+            7, 7), stride=(2, 2), padding=(3, 3))
+        self.maxpool1 = nn.MaxPool2d(kernel_size=(
+            3, 3), stride=(2, 2), padding=(1, 1))
+
+        self.conv2 = ConvBlock(64, 192, kernel_size=(
+            3, 3), stride=(1, 1), padding=(1, 1))
+        self.maxpool2 = nn.MaxPool2d(kernel_size=(
+            3, 3), stride=(2, 2), padding=(1, 1))
+
+        self.inception3a = InceptionBlock(192, 64, 96, 128, 16, 32, 32)
+        self.inception3b = InceptionBlock(256, 128, 128, 192, 32, 96, 64)
+        self.maxpool3 = nn.MaxPool2d(kernel_size=(
+            3, 3), stride=(2, 2), padding=(1, 1))
+
+        self.inception4a = InceptionBlock(480, 192, 96, 208, 16, 48, 64)
+        self.aux1 = AuxilaryBlock(512)
+
+        self.inception4b = InceptionBlock(512, 160, 112, 224, 24, 64, 64)
+        self.inception4c = InceptionBlock(512, 128, 128, 256, 24, 64, 64)
+        self.inception4d = InceptionBlock(512, 112, 144, 288, 32, 64, 64)
+        self.aux2 = AuxilaryBlock(528)
+
+        self.inception4e = InceptionBlock(528, 256, 160, 320, 32, 128, 128)
+        self.maxpool4 = nn.MaxPool2d(kernel_size=(
+            3, 3), stride=(2, 2), padding=(1, 1))
+
+        self.inception5a = InceptionBlock(832, 256, 160, 320, 32, 128, 128)
+        self.inception5b = InceptionBlock(832, 384, 192, 384, 48, 128, 128)
+
+        self.avgpool = nn.AvgPool2d(kernel_size=(7, 7), stride=(1, 1))
+        self.dropout = nn.Dropout(p=0.4)
+        self.fc1 = nn.Linear(1024, 1000)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.maxpool1(x)
+
+        x = self.conv2(x)
+        x = self.maxpool2(x)
+
+        x = self.inception3a(x)
+        x = self.inception3b(x)
+        x = self.maxpool3(x)
+
+        x = self.inception4a(x)
+        if self.training:
+            aux1 = self.aux1(x)
+
+        x = self.inception4b(x)
+        x = self.inception4c(x)
+        x = self.inception4d(x)
+        if self.training:
+            aux2 = self.aux2(x)
+
+        x = self.inception4e(x)
+        x = self.maxpool4(x)
+
+        x = self.inception5a(x)
+        x = self.inception5b(x)
+
+        x = self.avgpool(x)
+        x = x.reshape(x.shape[0], -1)
+        x = self.dropout(x)
+        x = self.fc1(x)
+
+        if self.training:
+            return aux1, aux2, x
+        else:
+            return x
+
+
+class VGG(nn.Module):
+    def __init__(self, architecture):
+        super().__init__()
+        self.conv_layers = self.get_conv_layers(architecture)
+        self.fc_layers = self.get_fc_layers()
+
+    def get_conv_layers(self, architecture):
+        layers = []
+        in_channels = 3
+
+        for a in architecture:
+            if type(a) == int:
+                layers += [nn.Conv2d(in_channels=in_channels, out_channels=a, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+                           nn.BatchNorm2d(a),
+                           nn.ReLU()]
+
+                in_channels = a
+
+            elif a == "M":
+                layers += [nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))]
+
+        return nn.Sequential(*layers)
+
+    def get_fc_layers(self):
+        layers = [nn.Linear(512 * 7 * 7, 4096),
+                  nn.ReLU(),
+                  nn.Dropout(p=0.5),
+                  nn.Linear(4096, 4096),
+                  nn.ReLU(),
+                  nn.Dropout(p=0.5),
+                  nn.Linear(4096, 1000)]
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = x.reshape(x.shape[0], -1)
+        x = self.fc_layers(x)
+
+        return x
+
+
+VGG_architectures = {"VGG11": [64, "M", 128, "M", 256, 256, "M", 512, 512, "M", 512, 512, "M"],
+                     "VGG13": [64, 64, "M", 128, 128, "M", 256, 256, "M", 512, 512, "M", 512, 512, "M"],
+                     "VGG16": [64, 64, "M", 128, 128, "M", 256, 256, 256, "M", 512, 512, 512, "M", 512, 512, 512, "M"],
+                     "VGG19": [64, 64, "M", 128, 128, "M", 256, 256, 256, 256, "M", 512, 512, 512, 512, "M", 512, 512, 512, 512, "M"]}
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, intermediate_channels, identity_downsample=None, stride=1):
+        super().__init__()
+        self.expansion = 4
+
+        self.conv1 = nn.Conv2d(
+            in_channels, intermediate_channels, kernel_size=1, stride=1, padding=0)
+        self.batchnorm1 = nn.BatchNorm2d(intermediate_channels)
+
+        self.conv2 = nn.Conv2d(
+            intermediate_channels, intermediate_channels, kernel_size=3, stride=stride, padding=1)
+        self.batchnorm2 = nn.BatchNorm2d(intermediate_channels)
+
+        self.conv3 = nn.Conv2d(intermediate_channels, intermediate_channels * self.expansion,
+                               kernel_size=1, stride=1, padding=0)
+        self.batchnorm3 = nn.BatchNorm2d(
+            intermediate_channels * self.expansion)
+
+        self.relu = nn.ReLU()
+        self.identity_downsample = identity_downsample
+
+    def forward(self, x):
+        identity = x
+
+        x = self.conv1(x)
+        x = self.batchnorm1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.batchnorm2(x)
+        x = self.relu(x)
+
+        x = self.conv3(x)
+        x = self.batchnorm3(x)
+
+        if self.identity_downsample is not None:
+            identity = self.identity_downsample(identity)
+
+        x += identity
+        x = self.relu(x)
+
+        return x
+
+
+class ResNet(nn.Module):
+    def __init__(self, architecture):
+        super().__init__()
+        self.in_channels = 64
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
+        self.batchnorm = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.block1 = self.get_layers(
+            architecture[0], intermediate_channels=64, stride=1)
+        self.block2 = self.get_layers(
+            architecture[1], intermediate_channels=128, stride=2)
+        self.block3 = self.get_layers(
+            architecture[2], intermediate_channels=256, stride=2)
+        self.block4 = self.get_layers(
+            architecture[3], intermediate_channels=512, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * 4, 1000)
+
+    def get_layers(self, num_layers, intermediate_channels, stride):
+        layers = []
+        identity_downsample = nn.Sequential(nn.Conv2d(self.in_channels, intermediate_channels * 4, kernel_size=1, stride=stride),
+                                            nn.BatchNorm2d(intermediate_channels * 4))
+
+        layers.append(ConvBlock(self.in_channels,
+                                intermediate_channels, identity_downsample, stride))
+        self.in_channels = intermediate_channels * 4
+
+        for _ in range(num_layers - 1):
+            layers.append(ConvBlock(self.in_channels, intermediate_channels))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.batchnorm(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+
+        x = self.avgpool(x)
+        x = x.reshape(x.shape[0], -1)
+        x = self.fc(x)
+
+        return x
+
+
+class LeNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=6, kernel_size=(
+            5, 5), stride=(1, 1), padding=(0, 0))
+        self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=(
+            5, 5), stride=(1, 1), padding=(0, 0))
+        self.conv3 = nn.Conv2d(in_channels=16, out_channels=120, kernel_size=(
+            5, 5), stride=(1, 1), padding=(0, 0))
+
+        self.fc1 = nn.Linear(120, 84)
+        self.fc2 = nn.Linear(84, 10)
+
+        self.relu = nn.ReLU()
+        self.pool = nn.AvgPool2d(kernel_size=(2, 2), stride=(2, 2))
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.pool(x)
+
+        x = self.relu(self.conv2(x))
+        x = self.pool(x)
+
+        x = self.relu(self.conv3(x))
+        x = x.reshape(x.shape[0], -1)
+
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)
+
+        return x
+
+
+warnings.filterwarnings("ignore")
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+torch.backends.cudnn.deterministic = True
+
+
+class ReplayMemory():
+    def __init__(self, mem_capacity, batch_size):
+        self.mem_capacity = mem_capacity
+        self.batch_size = batch_size
+        self.memory = deque(maxlen=self.mem_capacity)
+        self.Transition = namedtuple(
+            'Transition', ('state', 'action', 'reward', 'next_state'))
+
+    def __len__(self):
+        return len(self.memory)
+
+    def push(self, s, a, r, ns):
+        s = torch.FloatTensor(s)
+        a = torch.LongTensor([a])
+        r = torch.FloatTensor([r])
+        if ns is not None:
+            ns = torch.FloatTensor(ns)
+
+        transition = self.Transition(
+            state=s, action=a, reward=r, next_state=ns)
+        self.memory.append(transition)
+
+    def sample(self):
+        transitions = random.sample(self.memory, self.batch_size)
+        return self.Transition(*(zip(*transitions)))
+
+
+class SkipMax(gym.Wrapper):
+    def __init__(self, env, skip=4):
+        gym.Wrapper.__init__(self, env)
+        self.skip = skip
+        self.frame_buffer = np.zeros(
+            (2,) + env.observation_space.shape, dtype=np.uint8)
+
+    def reset(self):
+        return self.env.reset()
+
+    def step(self, action):
+        total_reward = 0
+        for i in range(self.skip):
+            state, reward, done, info = self.env.step(action)
+
+            if i == self.skip - 2:
+                self.frame_buffer[0] = state
+
+            if i == self.skip - 1:
+                self.frame_buffer[1] = state
+
+            total_reward += reward
+            if done:
+                break
+
+        max_frame = self.frame_buffer.max(axis=0)
+        return max_frame, total_reward, done, info
+
+
+class WrapFrame(gym.ObservationWrapper):
+    def __init__(self, env):
+        gym.ObservationWrapper.__init__(self, env)
+        self.width = 84
+        self.height = 84
+        self.observation_space = gym.spaces.Box(
+            low=0, high=255, shape=(self.height, self.width, 1), dtype=np.uint8)
+
+    def observation(self, frame):
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        frame = cv2.resize(frame, (self.width, self.height),
+                           interpolation=cv2.INTER_AREA)
+        return frame[:, :, None]
+
+
+class ClipReward(gym.RewardWrapper):
+    def __init__(self, env):
+        gym.RewardWrapper.__init__(self, env)
+
+    def reward(self, r):
+        return np.sign(r)
+
+
+class LazyFrames(object):
+    def __init__(self, frames):
+        self.frames = frames
+        self.output = None
+
+    def get_output(self):
+        if self.output is None:
+            self.output = np.concatenate(self.frames, axis=2)
+            self.frames = None
+
+        return self.output
+
+    def __array__(self, dtype=None):
+        output = self.get_output()
+        if dtype is not None:
+            output = output.astype(dtype)
+
+        return output
+
+    def __len__(self):
+        return len(self.get_output())
+
+    def __getitem__(self, index):
+        return self.get_output()[index]
+
+
+class StackFrames(gym.Wrapper):
+    def __init__(self, env, k=4):
+        gym.Wrapper.__init__(self, env)
+        self.k = k
+        self.frames = deque(maxlen=k)
+
+        obs_shape = env.observation_space.shape
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(
+            obs_shape[0], obs_shape[1], obs_shape[2] * k), dtype=np.uint8)
+
+    def get_frames(self):
+        return LazyFrames(list(self.frames))
+
+    def reset(self):
+        obs = self.env.reset()
+        for _ in range(self.k):
+            self.frames.append(obs)
+
+        return self.get_frames()
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        self.frames.append(obs)
+
+        return self.get_frames(), reward, done, info
+
+
+class WrapImage(gym.ObservationWrapper):
+    def __init__(self, env):
+        gym.ObservationWrapper.__init__(self, env)
+        obs_shape = env.observation_space.shape
+        self.observation_shape = gym.spaces.Box(low=0.0, high=1.0, shape=(
+            obs_shape[-1], obs_shape[0], obs_shape[1]), dtype=np.uint8)
+
+    def observation(self, image):
+        return np.swapaxes(image, 2, 0)
+
+
+def get_env(env_name):
+    env = gym.make(env_name)
+    env = SkipMax(env)
+    env = WrapFrame(env)
+    env = ClipReward(env)
+    env = StackFrames(env)
+    env = WrapImage(env)
+    return env
+
+
+class DuelingDQN(nn.Module):
+    def __init__(self, output_size):
+        super().__init__()
+        self.conv1 = nn.Conv2d(4, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+
+        self.a_fc1 = nn.Linear(7 * 7 * 64, 512)
+        self.a_fc2 = nn.Linear(512, output_size)
+
+        self.v_fc1 = nn.Linear(7 * 7 * 64, 512)
+        self.v_fc2 = nn.Linear(512, 1)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(x.shape[0], -1)
+
+        a = F.relu(self.a_fc1(x))
+        a = self.a_fc2(a)
+
+        v = F.relu(self.v_fc1(x))
+        v = self.v_fc2(v)
+
+        return a + v - a.mean()
+
+
+class Agent():
+    def __init__(self, env, net, memory, update_freq, learning_start, e_start, e_end, e_steps, gamma, target_update, print_every, render):
+        self.env = env
+        self.net = net.to(device)
+        self.memory = memory
+        self.update_freq = update_freq
+        self.learning_start = learning_start
+        self.e_start = e_start
+
+        self.e_end = e_end
+        self.e_steps = e_steps
+        self.gamma = gamma
+        self.target_update = target_update
+        self.print_every = print_every
+        self.render = render
+
+        self.steps = 0
+        self.episode = 0
+        self.target_net = copy.deepcopy(self.net)
+        self.target_net.eval()
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=1e-4)
+
+    def get_epsilon(self):
+        epsilon = self.e_end + (self.e_start - self.e_end) * \
+            math.exp(-1. * self.steps / self.e_steps)
+        return epsilon
+
+    def get_action(self, state):
+        epsilon = self.get_epsilon()
+        if random.random() < epsilon:
+            action = self.env.action_space.sample()
+        else:
+            with torch.no_grad():
+                state = torch.FloatTensor(state).unsqueeze(0).to(device)
+                Q = self.net(state)
+                action = Q.max(1)[1].item()
+
+        return action
+
+    def train(self, episodes):
+        ep_rewards = []
+
+        for episode in tqdm.tqdm(range(episodes), total=episodes):
+            done = False
+            episode_reward = 0
+            state = self.env.reset()
+
+            while not done:
+                if self.render == True and episode % self.print_every == 0:
+                    env.render()
+
+                action = self.get_action(state)
+                next_state, reward, done, _ = self.env.step(action)
+                episode_reward += reward
+                self.memory.push(state, action, reward,
+                                 None if done else next_state)
+                state = next_state
+                self.steps += 1
+
+                if self.steps % self.update_freq == 0 and self.steps > self.learning_start:
+                    ep_loss = self.optimize()
+
+                if self.steps % (self.target_update * self.update_freq) == 0 and self.steps > self.learning_start:
+                    self.target_net.load_state_dict(self.net.state_dict())
+
+            ep_rewards.append(episode_reward)
+            if episode % self.print_every == 0:
+                avg_reward = np.mean(ep_rewards[-self.print_every:])
+                print(f" episode: {episode} | avg_reward: {avg_reward:.4f}")
+
+        return ep_rewards
+
+    def optimize(self):
+        mem_sample = self.memory.sample()
+        non_terminal_mask = torch.ByteTensor(
+            list(map(lambda ns: ns is not None, mem_sample.next_state)))
+
+        state_batch = torch.cat(mem_sample.state).to(device)
+        action_batch = torch.cat(mem_sample.action).unsqueeze(1).to(device)
+        reward_batch = torch.cat(mem_sample.reward).unsqueeze(1).to(device)
+        non_terminal_next_state_batch = torch.cat(
+            [ns for ns in mem_sample.next_state if ns is not None]).to(device)
+
+        state_batch = state_batch.view(self.memory.batch_size, 4, 84, 84)
+        non_terminal_next_state_batch = non_terminal_next_state_batch.view(
+            -1, 4, 84, 84)
+
+        Q_preds = self.net(state_batch)
+        Q_vals = Q_preds.gather(1, action_batch)
+
+        with torch.no_grad():
+            net_preds = self.net(non_terminal_next_state_batch)
+        target_preds = self.target_net(non_terminal_next_state_batch)
+
+        net_actions = net_preds.max(1)[1].unsqueeze(1)
+        target_Q = target_preds.gather(1, net_actions)
+        target_vals = torch.zeros(self.memory.batch_size, 1).to(device)
+        target_vals[non_terminal_mask] = target_Q
+
+        expected_vals = reward_batch + (self.gamma * target_vals)
+        loss = F.smooth_l1_loss(Q_vals, expected_vals.detach())
+
+        self.opt.zero_grad()
+        loss.backward()
+        for p in self.net.parameters():
+            p.grad.data.clamp_(-1, 1)
+        self.opt.step()
+
+        return loss.item()
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+episodes = 500
+mem_capacity = 10000
+batch_size = 32
+render = False
+env_name = "PongNoFrameskip-v4"
+output_size = gym.make(env_name).action_space.n
+learning_start = 10000
+update_freq = 1
+e_start = 1.0
+e_end = 0.01
+e_steps = 30000
+gamma = 0.99
+target_update = 1000
+print_every = 50
+
+env = get_env(env_name)
+env.seed(SEED)
+memory = ReplayMemory(mem_capacity, batch_size)
+net = DuelingDQN(output_size)
+agent = Agent(env, net, memory, update_freq, learning_start, e_start, e_end,
+              e_steps, gamma, target_update, print_every, render)
+reward_history = agent.train(episodes)
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = [0, 5, 10, 19, 28]
+        self.vgg = models.vgg19(pretrained=True).features[:29]
+
+        for param in self.vgg.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        features = []
+        for i, layer in enumerate(self.vgg):
+            x = layer(x)
+            if i in self.layers:
+                features.append(x)
+
+        return features
+
+
+def load_image(img, transform, device):
+    img = Image.open(img)
+    img = transform(img).unsqueeze(0).to(device)
+    return img
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+img_size = 356
+device
+
+transform = transforms.Compose([transforms.Resize((img_size, img_size)),
+                                transforms.ToTensor()])
+
+loop = tqdm.tqdm(range(steps), total=steps, leave=False)
+for step in loop:
+    og_features = net(original_img)
+    gen_features = net(generated_img)
+    sty_features = net(style_img)
+
+    content_loss = 0
+    style_loss = 0
+
+    for o, g, s in zip(og_features, gen_features, sty_features):
+        b, c, h, w = g.shape
+        content_loss += torch.mean((g - o) ** 2)
+
+        G = g.view(c, h * w).mm(g.view(c, h * w).t())
+        S = s.view(c, h * w).mm(s.view(c, h * w).t())
+
+        style_loss += torch.mean((G - S) ** 2)
+
+    loss = alpha * content_loss + beta * style_loss
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+    if step % 1000 == 0:
+        print(f" Loss: {np.round(loss.item(), 4)}")
+        save_image(generated_img, f"output_{step}.png")
+        print("Image Saved!!")
+        print("")
+
+
+class Layer(object):
+    def set_input_shape(self, shape):
+        self.input_shape = shape
+
+    def layer_name(self):
+        return self.__class__.__name__
+
+    def n_parameters(self):
+        return 0
+
+    def forward_propagation(self, X, training):
+        raise NotImplementedError()
+
+    def backward_propagation(self, grad):
+        raise NotImplementedError()
+
+    def output_shape(self):
+        raise NotImplementedError()
+
+
+class Dense(Layer):
+    def __init__(self, n_units, input_shape=None):
+        self.n_units = n_units
+        self.input_shape = input_shape
+        self.input = None
+        self.trainable = True
+        self.w = None
+        self.b = None
+
+    def init_parameters(self, opt):
+        i = 1 / math.sqrt(self.input_shape[0])
+        self.w = np.random.uniform(-i, i, (self.input_shape[0], self.n_units))
+        self.b = np.zeros((1, self.n_units))
+        self.w_opt = copy.copy(opt)
+        self.b_opt = copy.copy(opt)
+
+    def n_parameters(self):
+        return np.prod(np.shape(self.w) + np.shape(self.b))
+
+    def forward_propagation(self, X, training=True):
+        self.layer_input = X
+        a = X.dot(self.w) + self.b
+        return a
+
+    def backward_propagation(self, grad):
+        w = self.w
+        if self.trainable:
+            grad_w = self.layer_input.T.dot(grad)
+            grad_b = np.sum(grad, axis=0, keepdims=True)
+            self.w = self.w_opt.update(self.w, grad_w)
+            self.b = self.b_opt.update(self.b, grad_b)
+
+        grad = grad.dot(w.T)
+        return grad
+
+    def output_shape(self):
+        return (self.n_units, )
+
+
+activ_fns = {
+    'relu': ReLU,
+    'sigmoid': Sigmoid,
+    'elu': ELU,
+    'softmax': Softmax,
+    'leaky_relu': LeakyReLU,
+    'tanh': TanH,
+}
+
+
+class Activation(Layer):
+    def __init__(self, name):
+        self.activ_name = name
+        self.activ_fn = activ_fns[name]()
+        self.trainable = True
+
+    def layer_name(self):
+        return "Activation (%s)" % (self.activ_fn.__class__.__name__)
+
+    def forward_propagation(self, X, training=True):
+        self.layer_input = X
+        return self.activ_fn(X)
+
+    def backward_propagation(self, grad):
+        return grad * self.activ_fn.gradient(self.layer_input)
+
+    def output_shape(self):
+        return self.input_shape
+
+
+class Conv2D(Layer):
+    def __init__(self, n_filters, filter_shape, input_shape=None, padding="same shape", stride=1):
+        self.n_filters = n_filters
+        self.filter_shape = filter_shape
+        self.input_shape = input_shape
+        self.padding = padding
+        self.stride = stride
+        self.trainable = True
+
+    def init_parameters(self, opt):
+        fh, fw = self.filter_shape
+        c = self.input_shape[0]
+        i = 1 / math.sqrt(np.prod(self.filter_shape))
+        self.w = np.random.uniform(-i, i, size=(self.n_filters, c, fh, fw))
+        self.b = np.zeros((self.n_filters, 1))
+        self.w_opt = copy.copy(opt)
+        self.b_opt = copy.copy(opt)
+
+    def n_parameters(self):
+        return np.prod(self.w.shape) + np.prod(self.b.shape)
+
+    def forward_propagation(self, X, training=True):
+        bs, c, h, w = X.shape
+        self.layer_input = X
+        self.X_lat = img_2_lat(X, self.filter_shape,
+                               stride=self.stride, output_shape=self.padding)
+        self.w_lat = self.w.reshape((self.n_filters, -1))
+        a = self.w_lat.dot(self.X_lat) + self.b
+        a = a.reshape(self.output_shape() + (bs, ))
+
+        return a.transpose(3, 0, 1, 2)
+
+    def backward_propagation(self, grad):
+        grad = grad.transpose(1, 2, 3, 0).reshape(self.n_filters, -1)
+        if self.trainable:
+            grad_w = grad.dot(self.X_lat.T).reshape(self.w.shape)
+            grad_b = np.sum(grad, axis=1, keepdims=True)
+            self.w = self.w_opt.update(self.w, grad_w)
+            self.b = self.b_opt.update(self.b, grad_b)
+
+        grad = self.w_lat.T.dot(grad)
+        grad = lat_2_img(grad, self.layer_input.shape, self.filter_shape,
+                         stride=self.stride, output_shape=self.padding)
+
+        return grad
+
+    def output_shape(self):
+        c, h, w = self.input_shape
+        fh, fw = self.filter_shape
+        ph, pw = get_pads(self.filter_shape, output_shape=self.padding)
+        oh = (h + np.sum(ph) - fh) / self.stride + 1
+        ow = (w + np.sum(pw) - fw) / self.stride + 1
+
+        return self.n_filters, int(oh), int(ow)
+
+
+class SlowConv2D(Layer):
+    def __init__(self, n_filters, filter_shape, input_shape=None, pad=0, stride=1):
+        self.n_filters = n_filters
+        self.filter_shape = filter_shape
+        self.input_shape = input_shape
+        self.pad = pad
+        self.stride = stride
+        self.trainable = True
+
+    def init_parameters(self, opt):
+        fh, fw = self.filter_shape
+        c = self.input_shape[0]
+        i = 1 / math.sqrt(np.prod(self.filter_shape))
+        self.w = np.random.uniform(-i, i, size=(self.n_filters, c, fh, fw))
+        self.b = np.zeros((self.n_filters))
+        self.w_opt = copy.copy(opt)
+        self.b_opt = copy.copy(opt)
+
+    def n_parameters(self):
+        return np.prod(self.w.shape) + np.prod(self.b.shape)
+
+    def forward_propagation(self, X, training=True):
+        self.layer_input = X
+        N, C, H, W = X.shape
+        _, _, FH, FW = self.w.shape
+        X_pad = np.pad(X, [(0,), (0,), (self.pad,), (self.pad,)])
+        F, H_out, W_out = self.output_shape()
+        output = np.zeros((N, F, H_out, W_out))
+
+        for n in range(N):
+            for f in range(F):
+                for h_out in range(H_out):
+                    for w_out in range(W_out):
+                        height, width = h_out * self.stride, w_out * self.stride
+                        output[n, f, h_out, w_out] = np.sum(
+                            X_pad[n, :, height:height+FH, width:width+FW] * self.w[f, :]) + self.b[f]
+
+        return output
+
+    def backward_propagation(self, grad):
+        if self.trainable:
+            grad_w = np.zeros_like(self.w)
+            grad_b = np.sum(grad, axis=(0, 2, 3))
+            self.b = self.b_opt.update(self.b, grad_b)
+
+        X = self.layer_input
+        N, C, H, W = X.shape
+        _, _, FH, FW = self.w.shape
+        F, H_out, W_out = self.output_shape()
+        X_pad = np.pad(X, [(0,), (0,), (self.pad,), (self.pad,)])
+        output = np.zeros_like(X)
+        grad_xpad = np.zeros_like(X_pad)
+
+        for n in range(N):
+            for f in range(F):
+                for h_out in range(H_out):
+                    for w_out in range(W_out):
+                        height, width = h_out * self.stride, w_out * self.stride
+                        if self.trainable:
+                            grad_w[f, :] += X_pad[n, :, height:height+FH,
+                                                  width:width+FW] * grad[n, f, h_out, w_out]
+
+                        grad_xpad[n, :, height:height+FH, width:width +
+                                  FW] += grad[n, f, h_out, w_out] * self.w[f, :]
+
+        if self.trainable:
+            self.w = self.w_opt.update(self.w, grad_w)
+        output = grad_xpad[:, :, self.pad:self.pad+H, self.pad:self.pad+W]
+        return output
+
+    def output_shape(self):
+        c, h, w = self.input_shape
+        fh, fw = self.filter_shape
+        oh = (h + (2*self.pad) - fh) / self.stride + 1
+        ow = (w + (2*self.pad) - fw) / self.stride + 1
+
+        return self.n_filters, int(oh), int(ow)
+
+
+class LSTM(Layer):
+    def __init__(self, n_units, input_shape=None):
+        self.input_shape = input_shape
+        self.n_units = n_units
+        self.trainable = True
+        self.W_out = None
+        self.Wx = None
+        self.Wh = None
+
+    def init_parameters(self, opt):
+        T, D = self.input_shape
+        i = 1 / math.sqrt(D)
+        self.Wout = np.random.uniform(-i, i, (self.n_units, D))
+
+        i = 1 / math.sqrt(4 * self.n_units)
+        self.Wx = np.random.uniform(-i, i, (D, 4 * self.n_units))
+        self.Wh = np.random.uniform(-i, i, (self.n_units, 4 * self.n_units))
+        self.b = np.zeros((4 * self.n_units,))
+
+        self.Wx_opt = copy.copy(opt)
+        self.Wh_opt = copy.copy(opt)
+        self.Wout_opt = copy.copy(opt)
+        self.b_opt = copy.copy(opt)
+
+    def n_parameters(self):
+        return np.prod(self.W_out.shape) + np.prod(self.Wx.shape) + np.prod(self.Wh.shape) + np.prod(self.b.shape)
+
+    def sigmoid(self, x):
+        return 1 / (1 + np.exp(-x))
+
+    def forward_propagation(self, X, training=True):
+        self.cache = []
+        self.layer_input = X
+        N, T, D = X.shape
+        self.h = np.zeros((N, T, self.n_units))
+        prev_h = np.zeros((N, self.n_units))
+        prev_c = np.zeros((N, self.n_units))
+        i = 0
+        f = 0
+        o = 0
+        g = 0
+        gate_i = 0
+        gate_f = 0
+        gate_o = 0
+        gate_g = 0
+        next_c = np.zeros((N, self.n_units))
+        next_h = np.zeros((N, self.n_units))
+
+        for t in range(T):
+            self.x = X[:, t, :]
+            if t == 0:
+                self.cache.append((self.x, prev_h, prev_c, i, f, o, g, gate_i, gate_f,
+                                   gate_o, gate_g, next_c, next_h))
+            if t == 1:
+                self.cache.pop(0)
+            self._step_forward()
+            next_h = self.cache[-1][-1]
+            self.h[:, t, :] = next_h
+
+        output = np.dot(self.h, self.Wout)
+        return output
+
+    def backward_propagation(self, grad):
+        X = self.layer_input
+        N, T, D = X.shape
+        grad_ = np.zeros_like(X)
+        grad_Wx = np.zeros_like(self.Wx)
+        grad_Wh = np.zeros_like(self.Wh)
+        grad_Wout = np.zeros_like(self.Wout)
+        grad_b = np.zeros_like(self.b)
+        self.dprev_c = np.zeros((N, self.n_units))
+        self.dprev_h = np.zeros((N, self.n_units))
+
+        for t in reversed(range(T)):
+            self.grad_next = grad[:, t, :]
+            self._step_backward(t)
+            grad_[:, t, :] = self.dx
+            grad_Wx += self.dWx
+            grad_Wh += self.dWh
+            grad_Wout += self.dWout
+            grad_b += self.b
+
+        for g in [grad_Wh, grad_Wx, grad_Wout, grad_b, grad_]:
+            np.clip(g, -5, 5, out=g)
+
+        self.Wh = self.Wh_opt.update(self.Wh, grad_Wh)
+        self.Wx = self.Wx_opt.update(self.Wx, grad_Wx)
+        self.Wout = self.Wout_opt.update(self.Wout, grad_Wout)
+        self.b = self.b_opt.update(self.b, grad_b)
+        return grad_
+
+    def _step_forward(self):
+        prev_c, prev_h = self.cache[-1][-2], self.cache[-1][-1]
+
+        x = self.x
+        a = np.dot(prev_h, self.Wh) + np.dot(x, self.Wx) + self.b
+        i, f, o, g = np.split(a, 4, axis=1)
+        gate_i, gate_f, gate_o, gate_g = self.sigmoid(
+            i), self.sigmoid(f), self.sigmoid(o), np.tanh(g)
+        next_c = gate_f * prev_c + gate_i * gate_g
+        next_h = gate_o * np.tanh(next_c)
+
+        self.cache.append((x, prev_h, prev_c, i, f, o, g, gate_i,
+                           gate_f, gate_o, gate_g, next_c, next_h))
+
+    def _step_backward(self, t):
+        (x, prev_h, prev_c, i, f, o, g, gate_i, gate_f,
+         gate_o, gate_g, next_c, next_h) = self.cache[t]
+
+        self.dWout = np.dot(next_h.T, self.grad_next)
+        dnext_h = np.dot(self.grad_next, self.Wout.T)
+        dnext_h += self.dprev_h
+        dgate_o = dnext_h * np.tanh(next_c)
+        dnext_c = dnext_h * gate_o * (1 - np.tanh(next_c)**2)
+        dnext_c += self.dprev_c
+
+        dgate_f = dnext_c * prev_c
+        dgate_i = dnext_c * gate_g
+        dgate_g = dnext_c * gate_i
+        self.dprev_c = dnext_c * gate_f
+
+        dg = dgate_g * (1 - np.tanh(g) ** 2)
+        do = dgate_o * self.sigmoid(o) * (1 - self.sigmoid(o))
+        df = dgate_f * self.sigmoid(f) * (1 - self.sigmoid(f))
+        di = dgate_i * self.sigmoid(i) * (1 - self.sigmoid(i))
+
+        dinputs = np.concatenate((di, df, do, dg), axis=1)
+        self.dx = np.dot(dinputs, self.Wx.T)
+        self.dprev_h = np.dot(dinputs, self.Wh.T)
+        self.dWx = np.dot(x.T, dinputs)
+        self.dWh = np.dot(prev_h.T, dinputs)
+        self.db = np.sum(dinputs, axis=0)
+
+    def output_shape(self):
+        return self.input_shape
+
+
+class VanillaRNN(Layer):
+    def __init__(self, n_units, input_shape=None):
+        self.input_shape = input_shape
+        self.n_units = n_units
+        self.trainable = True
+        self.Whh = None
+        self.Wxh = None
+        self.Why = None
+
+    def init_parameters(self, opt):
+        timesteps, input_dim = self.input_shape
+        i = 1 / math.sqrt(input_dim)
+        self.Wxh = np.random.uniform(-i, i, (self.n_units, input_dim))
+
+        i = 1 / math.sqrt(self.n_units)
+        self.Whh = np.random.uniform(-i, i, (self.n_units, self.n_units))
+        self.Why = np.random.uniform(-i, i, (input_dim, self.n_units))
+        self.b = np.zeros((self.n_units,))
+
+        self.Whh_opt = copy.copy(opt)
+        self.Wxh_opt = copy.copy(opt)
+        self.Why_opt = copy.copy(opt)
+        self.b_opt = copy.copy(opt)
+
+    def n_parameters(self):
+        return np.prod(self.Whh.shape) + np.prod(self.Wxh.shape) + np.prod(self.Why.shape) + np.prod(self.b.shape)
+
+    def forward_propagation(self, X, training=True):
+        self.layer_input = X
+        N, T, D = X.shape
+        self.total_h_prev = np.zeros((N, T, self.n_units))
+        self.h = np.zeros((N, T, self.n_units))
+        self.h_prev = np.zeros((N, self.n_units))
+
+        for t in range(T):
+            self.x = X[:, t, :]
+            self._step_forward()
+            self.h[:, t, :] = self.h_next
+            self.total_h_prev[:, t, :] = self.h_prev
+            self.h_prev = self.h_next
+
+        output = np.dot(self.h, self.Why.T)
+        return output
+
+    def backward_propagation(self, grad):
+        X = self.layer_input
+        N, T, D = X.shape
+        grad_ = np.zeros((N, T, D))
+        grad_Wxh = np.zeros((self.n_units, D))
+        grad_Whh = np.zeros((self.n_units, self.n_units))
+        grad_Why = np.zeros((D, self.n_units))
+        grad_b = np.zeros((self.n_units,))
+        self.dh_prev = 0
+
+        for t in reversed(range(T)):
+            self.grad_next = grad[:, t, :]
+            self._step_backward(t)
+            grad_[:, t, :] = self.dx
+            grad_Wxh += self.dWxh
+            grad_Whh += self.dWhh
+            grad_Why += self.dWhy
+            grad_b += self.db
+
+        for g in [grad_Whh, grad_Wxh, grad_Why, grad_b, grad_]:
+            np.clip(g, -5, 5, out=g)
+
+        self.Whh = self.Whh_opt.update(self.Whh, grad_Whh)
+        self.Wxh = self.Wxh_opt.update(self.Wxh, grad_Wxh)
+        self.Why = self.Why_opt.update(self.Why, grad_Why)
+        self.b = self.b_opt.update(self.b, grad_b)
+        return grad_
+
+    def _step_forward(self):
+        h_linear = np.dot(self.h_prev, self.Whh) + \
+            np.dot(self.x, self.Wxh.T) + self.b
+        self.h_next = np.tanh(h_linear)
+
+    def _step_backward(self, t):
+        self.dWhy = np.dot(self.grad_next.T, self.h[:, t, :])
+        dh = np.dot(self.grad_next, self.Why)
+        dh += self.dh_prev
+        dh = (1 - (self.h[:, t, :] ** 2)) * dh
+        self.dh_prev = np.dot(dh, self.Whh.T)
+        self.dWhh = np.dot(self.total_h_prev[:, t, :].T, dh)
+        self.dWxh = np.dot(dh.T, self.layer_input[:, t, :])
+        self.dx = np.dot(dh, self.Wxh)
+        self.db = np.sum(dh, axis=0)
+
+    def output_shape(self):
+        return self.input_shape
+
+
+class OldVanillaRNN(Layer):
+    def __init__(self, n_units, input_shape=None, activation='tanh', trunc=5):
+        self.input_shape = input_shape
+        self.n_units = n_units
+        self.activ = activ_fns[activation]()
+        self.trainable = True
+        self.trunc = trunc
+        self.Whh = None
+        self.Wxh = None
+        self.Why = None
+
+    def init_parameters(self, opt):
+        timesteps, input_dim = self.input_shape
+        i = 1 / math.sqrt(input_dim)
+        self.Wxh = np.random.uniform(-i, i, (self.n_units, input_dim))
+
+        i = 1 / math.sqrt(self.n_units)
+        self.Whh = np.random.uniform(-i, i, (self.n_units, self.n_units))
+        self.Why = np.random.uniform(-i, i, (input_dim, self.n_units))
+
+        self.Whh_opt = copy.copy(opt)
+        self.Wxh_opt = copy.copy(opt)
+        self.Why_opt = copy.copy(opt)
+
+    def n_parameters(self):
+        return np.prod(self.Whh.shape) + np.prod(self.Wxh.shape) + np.prod(self.Why.shape)
+
+    def forward_propagation(self, X, training=True):
+        self.layer_input = X
+        batch_size, timesteps, input_dim = X.shape
+
+        self.h_ba = np.zeros((batch_size, timesteps, self.n_units))
+        self.h = np.zeros((batch_size, timesteps+1, self.n_units))
+        self.y = np.zeros((batch_size, timesteps, input_dim))
+
+        self.h[:, -1] = np.zeros((batch_size, self.n_units))
+
+        for t in range(timesteps):
+            self.h_ba[:, t] = self.h[:, t -
+                                     1].dot(self.Whh.T) + X[:, t].dot(self.Wxh.T)
+            self.h[:, t] = self.activ(self.h_ba[:, t])
+            self.y[:, t] = self.h[:, t].dot(self.Why.T)
+
+        return self.y
+
+    def backward_propagation(self, grad):
+        _, timesteps, _ = grad.shape
+
+        grad_Wxh = np.zeros_like(self.Wxh)
+        grad_Whh = np.zeros_like(self.Whh)
+        grad_Why = np.zeros_like(self.Why)
+
+        grad_ = np.zeros_like(grad)
+        for t in reversed(range(timesteps)):
+            grad_Why += grad[:, t].T.dot(self.h[:, t])
+            grad_h = grad[:, t].dot(self.Why) * \
+                self.activ.gradient(self.h_ba[:, t])
+
+            grad_[:, t] = grad_h.dot(self.Wxh)
+
+            for t_ in reversed(np.arange(max(0, t - self.trunc), t+1)):
+                grad_Wxh += grad_h.T.dot(self.layer_input[:, t_])
+                grad_Whh += grad_h.T.dot(self.h[:, t_-1])
+
+                grad_h = grad_h.dot(self.Whh) * \
+                    self.activ.gradient(self.h_ba[:, t_-1])
+
+        for g in [grad_Whh, grad_Wxh, grad_Why, grad_]:
+            np.clip(g, -5, 5, out=g)
+
+        self.Whh = self.Whh_opt.update(self.Whh, grad_Whh)
+        self.Wxh = self.Wxh_opt.update(self.Wxh, grad_Wxh)
+        self.Why = self.Why_opt.update(self.Why, grad_Why)
+        return grad_
+
+    def output_shape(self):
+        return self.input_shape
+
+
+class BatchNorm2D(Layer):
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.trainable = True
+        self.eps = 0.01
+        self.running_mean = None
+        self.running_var = None
+
+    def init_parameters(self, opt):
+        self.gamma = np.ones(self.input_shape)
+        self.beta = np.zeros(self.input_shape)
+
+        self.gamma_opt = copy.copy(opt)
+        self.beta_opt = copy.copy(opt)
+
+    def n_parameters(self):
+        return np.prod(self.gamma.shape) + np.prod(self.beta.shape)
+
+    def forward_propagation(self, X, training=True):
+        self.layer_input = X
+        if len(self.layer_input.shape) == 3:
+            b, t, d = X.shape
+            X = X.reshape(b*t, d)
+            self.gamma = np.ones(d)
+            self.beta = np.zeros(d)
+        if self.running_mean is None:
+            self.running_mean = np.mean(X, axis=0)
+            self.running_var = np.var(X, axis=0)
+
+        if training and self.trainable:
+            mean = np.mean(X, axis=0)
+            var = np.var(X, axis=0)
+            self.running_mean = self.momentum * \
+                self.running_mean + (1 - self.momentum) * mean
+            self.running_var = self.momentum * \
+                self.running_var + (1 - self.momentum) * var
+        else:
+            mean = self.running_mean
+            var = self.running_var
+
+        X_centered = X - mean
+        self.stddev_inv = 1 / np.sqrt(var + self.eps)
+        self.X_norm = X_centered * self.stddev_inv
+        output = self.gamma * self.X_norm + self.beta
+        output = output.reshape(self.layer_input.shape)
+
+        return output
+
+    def backward_propagation(self, grad):
+        if len(grad.shape) == 3:
+            b, t, d = grad.shape
+            grad = grad.reshape(b*t, d)
+        if self.trainable:
+            grad_gamma = np.sum(grad * self.X_norm, axis=0)
+            grad_beta = np.sum(grad, axis=0)
+
+            self.gamma = self.gamma_opt.update(self.gamma, grad_gamma)
+            self.beta = self.beta_opt.update(self.beta, grad_beta)
+
+        batch_size = grad.shape[0]
+        grad = (1 / batch_size) * self.stddev_inv * (batch_size * grad - np.sum(grad, axis=0) -
+                                                     self.X_norm * np.sum(grad * self.X_norm, axis=0))
+        grad = grad.reshape(self.layer_input.shape)
+
+        return grad
+
+    def output_shape(self):
+        return self.input_shape
+
+
+class LayerNorm(Layer):
+    def __init__(self):
+        self.trainable = True
+        self.eps = 0.01
+
+    def init_parameters(self, opt):
+        self.gamma = np.ones(self.input_shape).reshape(-1)
+        self.beta = np.zeros(self.input_shape).reshape(-1)
+
+        self.gamma_opt = copy.copy(opt)
+        self.beta_opt = copy.copy(opt)
+
+    def n_parameters(self):
+        return np.prod(self.gamma.shape) + np.prod(self.beta.shape)
+
+    def forward_propagation(self, X, training=True):
+        self.layer_input = X
+        if len(self.layer_input.shape) == 3:
+            b, t, d = X.shape
+            X = X.reshape(d, b*t)
+            self.gamma = np.ones(d)
+            self.beta = np.zeros(d)
+        else:
+            b = X.shape[0]
+            X = X.reshape(-1, b)
+        mean = np.mean(X, axis=0)
+        var = np.var(X, axis=0)
+        X_centered = X - mean
+
+        self.stddev_inv = 1 / np.sqrt(var + self.eps)
+        self.X_norm = X_centered * self.stddev_inv
+        if len(self.layer_input.shape) == 3:
+            self.X_norm = self.X_norm.reshape(b*t, d)
+        else:
+            self.X_norm = self.X_norm.reshape(b, -1)
+        output = self.gamma * self.X_norm + self.beta
+        output = output.reshape(self.layer_input.shape)
+
+        return output
+
+    def backward_propagation(self, grad):
+        if len(grad.shape) == 3:
+            b, t, d = grad.shape
+            grad = grad.reshape(b*t, d)
+        else:
+            grad = grad.reshape(grad.shape[0], -1)
+        if self.trainable:
+            grad_gamma = np.sum(grad * self.X_norm, axis=0)
+            grad_beta = np.sum(grad, axis=0)
+
+            self.gamma = self.gamma_opt.update(self.gamma, grad_gamma)
+            self.beta = self.beta_opt.update(self.beta, grad_beta)
+
+        batch_size = grad.shape[0]
+        grad = (1 / batch_size) * self.stddev_inv * (batch_size * grad.T - np.sum(grad.T, axis=0) -
+                                                     self.X_norm.T * np.sum(grad.T * self.X_norm.T, axis=0))
+        grad = grad.reshape(self.layer_input.shape)
+
+        return grad
+
+    def output_shape(self):
+        return self.input_shape
+
+
+class Dropout(Layer):
+    def __init__(self, p=0.2):
+        self.p = p
+        self.mask = None
+        self.input_shape = None
+        self.n_units = None
+        self.trainable = True
+
+    def forward_propagation(self, X, training=True):
+        m = (1 - self.p)
+        if training:
+            self.mask = np.random.uniform(size=X.shape) > self.p
+            m = self.mask
+        return X * m
+
+    def backward_propagation(self, grad):
+        return grad * self.mask
+
+    def output_shape(self):
+        return self.input_shape
+
+
+class Flatten(Layer):
+    def __init__(self, input_shape=None):
+        self.input_shape = input_shape
+        self.prev_shape = None
+        self.trainable = True
+
+    def forward_propagation(self, X, training=True):
+        self.prev_shape = X.shape
+        X = X.reshape((X.shape[0], -1))
+        return X
+
+    def backward_propagation(self, grad):
+        return grad.reshape(self.prev_shape)
+
+    def output_shape(self):
+        return (np.prod(self.input_shape), )
+
+
+class PoolLayer(Layer):
+    def __init__(self, pool_shape=(2, 2), stride=1, padding="none"):
+        self.pool_shape = pool_shape
+        self.stride = stride
+        self.padding = padding
+        self.trainable = True
+
+    def forward_propagation(self, X, training=True):
+        self.layer_input = X
+        batch_size, channels, height, width = X.shape
+        _, out_height, out_width = self.output_shape()
+
+        X = X.reshape(batch_size*channels, 1, height, width)
+        X_col = img_2_lat(X, self.pool_shape, self.stride, self.padding)
+
+        output = self._pool_forward(X_col)
+        output = output.reshape(out_height, out_width, batch_size, channels)
+        output = output.transpose(2, 3, 0, 1)
+
+        return output
+
+    def backward_propagation(self, grad):
+        batch_size, _, _, _ = grad.shape
+        channels, height, width = self.input_shape
+        grad = grad.transpose(2, 3, 0, 1).ravel()
+
+        grad_col = self._pool_backward(grad)
+        grad = lat_2_img(grad_col, (batch_size * channels, 1, height, width),
+                         self.pool_shape, self.stride, self.padding)
+        grad = grad.reshape((batch_size,) + self.input_shape)
+
+        return grad
+
+    def output_shape(self):
+        channels, height, width = self.input_shape
+        if self.padding == "same shape":
+            out_height = height
+            out_width = width
+        else:
+            out_height = (height - self.pool_shape[0]) / self.stride + 1
+            out_width = (width - self.pool_shape[1]) / self.stride + 1
+
+        return channels, int(out_height), int(out_width)
+
+
+class MaxPool2D(PoolLayer):
+    def _pool_forward(self, X_col):
+        arg_max = np.argmax(X_col, axis=0).flatten()
+        output = X_col[arg_max, range(arg_max.size)]
+        self.cache = arg_max
+        return output
+
+    def _pool_backward(self, accum_grad):
+        accum_grad_col = np.zeros((np.prod(self.pool_shape), accum_grad.size))
+        arg_max = self.cache
+        accum_grad_col[arg_max, range(accum_grad.size)] = accum_grad
+        return accum_grad_col
+
+
+class AvgPool2D(PoolLayer):
+    def _pool_forward(self, X_col):
+        output = np.mean(X_col, axis=0)
+        return output
+
+    def _pool_backward(self, accum_grad):
+        accum_grad_col = np.zeros((np.prod(self.pool_shape), accum_grad.size))
+        accum_grad_col[:, range(accum_grad.size)] = 1. / \
+            accum_grad_col.shape[0] * accum_grad
+        return accum_grad_col
+
+
+class SlowMaxPool2D(Layer):
+    def __init__(self, pool_shape=(2, 2), stride=1):
+        self.pool_shape = pool_shape
+        self.stride = stride
+        self.trainable = True
+
+    def forward_propagation(self, X, training=True):
+        self.layer_input = X
+        N, C, H, W = X.shape
+        FH, FW = self.pool_shape
+        _, H_out, W_out = self.output_shape()
+        output = np.zeros((N, C, H_out, W_out))
+
+        for n in range(N):
+            for h_out in range(H_out):
+                for w_out in range(W_out):
+                    height, width = h_out * self.stride, w_out * self.stride
+                    output[n, :, h_out, w_out] = np.max(
+                        X[n, :, height:height+FH, width:width+FW], axis=(-2, -1))
+
+        return output
+
+    def backward_propagation(self, grad):
+        X = self.layer_input
+        N, C, H, W = X.shape
+        FH, FW = self.pool_shape
+        _, H_out, W_out = self.output_shape()
+        output = np.zeros_like(X)
+
+        for n in range(N):
+            for c in range(C):
+                for h_out in range(H_out):
+                    for w_out in range(W_out):
+                        height, width = h_out * self.stride, w_out * self.stride
+                        idx = np.unravel_index(
+                            np.argmax(X[n, c, height:height+FH, width:width+FW]), (FH, FW))
+                        output[n, c, height:height+FH, width:width +
+                               FW][idx] = grad[n, c, h_out, w_out]
+
+        return output
+
+    def output_shape(self):
+        channels, height, width = self.input_shape
+        out_height = (height - self.pool_shape[0]) / self.stride + 1
+        out_width = (width - self.pool_shape[1]) / self.stride + 1
+        return channels, int(out_height), int(out_width)
+
+
+class Reshape(Layer):
+    def __init__(self, shape, input_shape=None):
+        self.prev_shape = None
+        self.trainable = True
+        self.shape = shape
+        self.input_shape = input_shape
+
+    def forward_propagation(self, X, training=True):
+        self.prev_shape = X.shape
+        print((X.shape[0], ) + self.shape)
+        return X.reshape((X.shape[0], ) + self.shape)
+
+    def backward_propagation(self, grad):
+        return grad.reshape(self.prev_shape)
+
+    def output_shape(self):
+        return self.shape
+
+
+class DQN():
+    def __init__(self, env_name='CartPole-v1', epsilon=1, min_epsilon=0.1, gamma=0.9, decay_rate=0.005):
+        self.epsilon = epsilon
+        self.min_epsilon = min_epsilon
+        self.gamma = gamma
+        self.decay_rate = decay_rate
+        self.memory = []
+        self.memory_size = 200
+        self.env = gym.make(env_name)
+        self.n_states = self.env.observation_space.shape[0]
+        self.n_actions = self.env.action_space.n
+
+    def give_brain(self, brain):
+        self.brain = brain(n_inputs=self.n_states, n_outputs=self.n_actions)
+
+    def select_action(self, state):
+        if np.random.rand() < self.epsilon:
+            action = np.random.randint(self.n_actions)
+        else:
+            action = np.argmax(self.brain.predict(state), axis=1)[0]
+
+        return action
+
+    def stack_memory(self, state, action, reward, new_state, done):
+        self.memory.append((state, action, reward, new_state, done))
+        if len(self.memory) > self.memory_size:
+            self.memory.pop(0)
+
+    def random_play(self, replay):
+        X = np.zeros((len(replay), self.n_states))
+        y = np.zeros((len(replay), self.n_actions))
+
+        states = np.array([s[0] for s in replay])
+        new_states = np.array([ns[3] for ns in replay])
+
+        Q = self.brain.predict(states)
+        nQ = self.brain.predict(new_states)
+
+        for i in range(len(replay)):
+            s, a, r, ns, d = replay[i]
+            Q[i][a] = r
+            if not d:
+                Q[i][a] += self.gamma * np.amax(nQ[i])
+
+            X[i] = s
+            y[i] = Q[i]
+
+        return X, y
+
+    def train(self, epochs, batch_size):
+        max_reward = 0
+        for epoch in range(epochs):
+            state = self.env.reset()
+            total_reward = 0
+            epoch_loss = []
+            while True:
+                action = self.select_action(state)
+                new_state, reward, done, _ = self.env.step(action)
+                self.stack_memory(state, action, reward, new_state, done)
+
+                bs = min(len(self.memory), batch_size)
+                replay = random.sample(self.memory, bs)
+
+                X, y = self.random_play(replay)
+                loss, _ = self.brain.train(X, y)
+                epoch_loss.append(loss)
+
+                total_reward += reward
+                state = new_state
+                if done:
+                    break
+
+            self.epsilon = self.min_epsilon + \
+                (1.0 - self.min_epsilon) * np.exp(-self.decay_rate * epoch)
+
+            max_reward = max(max_reward, total_reward)
+
+        print("Training Done!!")
+
+    def play(self, epochs):
+        for epoch in range(epochs):
+            state = self.env.reset()
+            total_reward = 0
+            while True:
+                self.env.render()
+                action = np.argmax(self.brain.predict(state), axis=1)[0]
+                new_state, reward, done, _ = self.env.step(action)
+                total_reward += reward
+                state = new_state
+
+                if done:
+                    break
+
+            print(f"Epoch: {epoch} | Total Reward: {total_reward}")
+
+        self.env.close()
+
+
+class NeuroEvolution():
+    def __init__(self, brain_fn, population_size, mutation_rate):
+        self.brain_fn = brain_fn
+        self.pop_size = population_size
+        self.mut_rate = mutation_rate
+
+    def build_brain(self, id):
+        brain = self.brain_fn(n_inputs=self.X.shape[1],
+                              n_outputs=self.y.shape[1])
+        brain.id = id
+        brain.accuracy = 0
+        brain.fitness = 0
+
+        return brain
+
+    def init_pop(self):
+        self.population = []
+        for _ in range(self.pop_size):
+            brain = self.build_brain(np.random.randint(9999999))
+            self.population.append(brain)
+
+    def mutate(self, baby, var=1):
+        for layer in baby.layers:
+            if hasattr(layer, "w"):
+                mutation_mask = np.random.binomial(1, p=self.mut_rate,
+                                                   size=layer.w.shape)
+                layer.w += np.random.normal(loc=0, scale=var,
+                                            size=layer.w.shape) * mutation_mask
+                mutation_mask = np.random.binomial(1, p=self.mut_rate,
+                                                   size=layer.b.shape)
+                layer.b += np.random.normal(loc=0, scale=var,
+                                            size=layer.b.shape) * mutation_mask
+
+        return baby
+
+    def inherit_genes(self, baby, parent):
+        for i in range(len(baby.layers)):
+            if hasattr(baby.layers[i], "w"):
+                baby.layers[i].w = parent.layers[i].w.copy()
+                baby.layers[i].b = parent.layers[i].b.copy()
+
+    def fuck(self, parent0, parent1):
+        baby0 = self.build_brain(id=parent0.id+1)
+        baby1 = self.build_brain(id=parent1.id+1)
+
+        self.inherit_genes(baby0, parent0)
+        self.inherit_genes(baby1, parent1)
+
+        for i in range(len(baby0.layers)):
+            if hasattr(baby0.layers[i], "w"):
+                n_neurons = baby0.layers[i].w.shape[1]
+                z = np.random.randint(0, n_neurons)
+
+                baby0.layers[i].w[:, z:] = parent1.layers[i].w[:, z:].copy()
+                baby0.layers[i].b[:, z:] = parent1.layers[i].b[:, z:].copy()
+
+                baby1.layers[i].w[:, z:] = parent0.layers[i].w[:, z:].copy()
+                baby1.layers[i].b[:, z:] = parent0.layers[i].b[:, z:].copy()
+
+        return baby0, baby1
+
+    def calc_fitness(self):
+        for baby in self.population:
+            loss, acc = baby.test(self.X, self.y)
+            baby.accuracy = acc
+            baby.fitness = 1 / (loss + 1e-8)
+
+    def begin_evolution(self, X, y, generations):
+        self.X, self.y = X, y
+        self.init_pop()
+        n_winners = int(self.pop_size * 0.4)
+        n_parents = self.pop_size - n_winners
+
+        for i in range(generations):
+            self.calc_fitness()
+            best_fit_idx = np.argsort(
+                [brain.fitness for brain in self.population])[::-1]
+            self.population = [self.population[i] for i in best_fit_idx]
+
+            fittest_brain = self.population[0]
+
+            next_population = [self.population[i] for i in range(n_winners)]
+            total_fitness = np.sum(
+                [brain.fitness for brain in self.population])
+            parent_probs = [brain.fitness /
+                            total_fitness for brain in self.population]
+
+            parents = np.random.choice(self.population, size=n_parents,
+                                       p=parent_probs, replace=False)
+
+            for i in np.arange(0, len(parents), 2):
+                baby0, baby1 = self.fuck(parents[i], parents[i+1])
+                next_population += [self.mutate(baby0), self.mutate(baby1)]
+
+            self.population = next_population
+
+        return fittest_brain
+
+
+def get_pads(filter_shape, output_shape="same shape"):
+    if output_shape == "none":
+        return (0, 0), (0, 0)
+    elif output_shape == "same shape":
+        fh, fw = filter_shape
+        ph1 = int(math.floor((fh - 1)/2))
+        ph2 = int(math.ceil((fh - 1)/2))
+        pw1 = int(math.floor((fw - 1)/2))
+        pw2 = int(math.ceil((fw - 1)/2))
+        return (ph1, ph2), (pw1, pw2)
+
+
+def img_2_lat_idx(images_shape, filter_shape, padding, stride=1):
+    bs, c, h, w = images_shape
+    fh, fw = filter_shape
+    ph, pw = padding
+    oh = int((h + np.sum(ph) - fh) / stride + 1)
+    ow = int((w + np.sum(pw) - fw) / stride + 1)
+    x = np.repeat(np.arange(c), fh * fw).reshape(-1, 1)
+    y0 = np.repeat(np.arange(fh), fw)
+    y0 = np.tile(y0, c)
+    y1 = stride * np.repeat(np.arange(oh), ow)
+    z0 = np.tile(np.arange(fw), fh * c)
+    z1 = stride * np.tile(np.arange(ow), oh)
+    y = y0.reshape(-1, 1) + y1.reshape(1, -1)
+    z = z0.reshape(-1, 1) + z1.reshape(1, -1)
+    return (x, y, z)
+
+
+def img_2_lat(images, filter_shape, stride, output_shape='same shape'):
+    fh, fw = filter_shape
+    ph, pw = get_pads(filter_shape, output_shape)
+    padded_img = np.pad(images, ((0, 0), (0, 0), ph, pw), mode='constant')
+    x, y, z = img_2_lat_idx(images.shape, filter_shape, (ph, pw), stride)
+    lat = padded_img[:, x, y, z]
+    c = images.shape[1]
+    lat = lat.transpose(1, 2, 0).reshape(fh * fw * c, -1)
+    return lat
+
+
+def lat_2_img(lat, images_shape, filter_shape, stride, output_shape='same shape'):
+    bs, c, h, w = images_shape
+    ph, pw = get_pads(filter_shape, output_shape)
+    hap = h + np.sum(ph)
+    wap = w + np.sum(pw)
+    blank_img = np.zeros((bs, c, hap, wap))
+    x, y, z = img_2_lat_idx(images_shape, filter_shape, (ph, pw), stride)
+    lat = lat.reshape(c * np.prod(filter_shape), -1, bs)
+    lat = lat.transpose(2, 0, 1)
+    np.add.at(blank_img, (slice(None), x, y, z), lat)
+    return blank_img[:, :, ph[0]:h+ph[0], pw[0]:w+pw[0]]

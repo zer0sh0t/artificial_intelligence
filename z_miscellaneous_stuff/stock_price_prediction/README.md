@@ -1,0 +1,2 @@
+I believe that stock price prediction is like the horoscopy of ML. I think this is absolute garbage and couldn't predict the fluctuations accurately because, there are a lot of features in the real world which can't be represented in the data that could potentially affect the price of the stock like [elon musk's tweets](https://twitter.com/elonmusk/status/1357236825589432322). 
+But, I am trying this out anyway just to see what this is about.

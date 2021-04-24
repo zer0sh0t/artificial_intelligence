@@ -1,0 +1,1 @@
+[YOLOv1 paper](https://arxiv.org/abs/1506.02640) | [YOLOv3 paper](https://arxiv.org/abs/1804.02767) | Download link for [full dataset](https://www.kaggle.com/dataset/734b7bcb7ef13a045cbdd007a3c19874c2586ed0b02b4afc86126e89d00af8d2)
