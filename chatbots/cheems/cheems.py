@@ -1,9 +1,15 @@
 import os
 import torch
+import argparse
 import playsound
 from gtts import gTTS
 import speech_recognition as sr
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--use_mic", type=int, default=1)
+parser.add_argument("--speak", type=int, default=1)
+args = parser.parse_args()
 
 class Cheems():
     def __init__(self):
@@ -40,7 +46,7 @@ class Cheems():
         self.step += 1
         return ret
 
-    def chat(self, use_mic=True, speak=True):
+    def chat(self, use_mic, speak):
         greeting = "Hi Human!"
         print(f"cheems: {greeting}")
         if speak:
@@ -61,4 +67,4 @@ class Cheems():
 if __name__ == "__main__":
     print("booting up...")
     cheems = Cheems()
-    cheems.chat()
+    cheems.chat(use_mic=args.use_mic, speak=args.speak)
