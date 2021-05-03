@@ -13,9 +13,9 @@ args = parser.parse_args()
 
 class Cheems():
     def __init__(self):
-        self.step = 0
+        # self.step = 0
         self.r = sr.Recognizer()
-        self.chat_history_ids = None
+        # self.chat_history_ids = None
         self.temp_file = "output.mp3"
         self.tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
         self.model = AutoModelForCausalLM.from_pretrained("microsoft/DialoGPT-medium")
@@ -40,10 +40,11 @@ class Cheems():
 
     def _reply(self, inp):
         new_user_input_ids = self.tokenizer.encode(inp + self.tokenizer.eos_token, return_tensors='pt')
-        bot_input_ids = torch.cat([self.chat_history_ids, new_user_input_ids], dim=-1) if self.step > 0 else new_user_input_ids
+        bot_input_ids = new_user_input_ids
+        # bot_input_ids = torch.cat([self.chat_history_ids, new_user_input_ids], dim=-1) if self.step > 0 else new_user_input_ids
         self.chat_history_ids = self.model.generate(bot_input_ids, max_length=1000, pad_token_id=self.tokenizer.eos_token_id)
         ret = self.tokenizer.decode(self.chat_history_ids[:, bot_input_ids.shape[-1]:][0], skip_special_tokens=True)
-        self.step += 1
+        # self.step += 1
         return ret
 
     def chat(self, use_mic, speak):
