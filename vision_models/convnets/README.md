@@ -1,1 +1,1 @@
-**coding various convnet architectures**
+**coding various convnets**
