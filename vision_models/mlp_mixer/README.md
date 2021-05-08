@@ -1,0 +1,1 @@
+mlp-mixer [paper](https://arxiv.org/pdf/2105.01601v1.pdf)
