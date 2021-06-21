@@ -1,1 +1,1 @@
-**an rnn trained on python files to write code**
+an rnn trained on python files to write code
