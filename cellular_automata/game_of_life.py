@@ -13,20 +13,20 @@ res = 10 # resolution
 rand_init = False # random initialization
 pygame.init()
 win = pygame.display.set_mode((w, h))
-pygame.display.set_caption('game of life')
+pygame.display.set_caption('game_of_life')
 
 class Cell():
     def __init__(self, state, x, y, res):
         self.state = state
         self.rect = (x, y, res, res)
-        self.white = (255, 255, 255)
+        self.purple = (148, 0, 211)
         self.black = (0, 0, 0)
         
     def draw(self, win):
         if self.state == 0:
             pygame.draw.rect(win, self.black, self.rect)
         elif self.state == 1:
-            pygame.draw.rect(win, self.white, self.rect)
+            pygame.draw.rect(win, self.purple, self.rect)
             
 class Grid():
     def __init__(self, win, rows, cols, res, rand_init):
@@ -53,6 +53,9 @@ class Grid():
                     row = (x + i + self.rows) % self.rows # wrap-around
                     col = (y + j + self.cols) % self.cols
                     num_neighbors += self.curr_grid[row][col].state
+                    
+                    if num_neighbors > 3:
+                        return num_neighbors
         return num_neighbors
                 
     def update(self):
@@ -88,7 +91,7 @@ def main(win, h, w, res, rand_init):
     font = pygame.font.SysFont('ubuntumono', 25)
 
     while True:
-        text = font.render(f'gen:{gen}', True, (255, 255, 255), (0, 0, 0))
+        text = font.render(f'gen:{gen}', True, (148, 0, 211), (0, 0, 0))
         win.blit(text, (12, 7))
         pygame.display.flip()
         
